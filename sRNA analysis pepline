@@ -1,0 +1,175 @@
+#! /usr/bin/bash
+set -euo pipefail
+
+# ======================== 配置区（可自由修改）========================
+# 所有路径均使用相对路径，便于移植到任意环境
+THREADS=24
+MIN_LEN=18
+MAX_LEN=30
+CONDENSE_ENV=""  # 如需激活conda环境请填写名称
+
+# 参考基因组与注释文件（放置在项目目录下的 ref 文件夹）
+GENOME_FA="./ref/genome.fa"
+FEATURES_GFF3="./ref/features.gff3"
+MIRNA_GFF3="./ref/ncRNA_gene.miRNA.gff3"
+INTRON_GFF3="./ref/intron.uniq.reorder.gff3"
+GENE_GFF3="./ref/gene.gff3"
+PRIORITY_TXT="./ref/sRNA_source_feature.priority.txt"
+# =====================================================================
+
+# 激活conda环境（如不需要可注释）
+if [ -n "${CONDENSE_ENV}" ]; then
+    conda activate ${CONDENSE_ENV}
+fi
+
+# ======================== 1. 数据修剪（已注释，按需启用）========================
+# mkdir -p 1.trimmed_data
+# python ~/pipelines/remove_adapter.py -i group.csv -o 1.trimmed_data
+
+# ======================== 2. sRNA 比对到基因组 ========================
+mkdir -p 2.mapping_sRNA_to_genome_by_ShortStack
+cd 2.mapping_sRNA_to_genome_by_ShortStack
+
+for FQ in ../1.trimmed_data/*.fq.gz
+do
+    sample=$(basename "${FQ}" .fq.gz)
+    ShortStack \
+        --readfile "${FQ}" \
+        --genomefile "${GENOME_FA}" \
+        --outdir "${sample}" \
+        --bowtie_cores 1 \
+        --mismatches 1 \
+        --mmap f \
+        --dicermin 20 \
+        --dicermax 24 \
+        --foldsize 300 \
+        --pad 75 \
+        --show_secondaries \
+        2> "${sample}.log" &
+done
+wait
+cd ../
+
+# ======================== 3. featureCounts 注释来源 ========================
+mkdir -p 3.1.mark_tag_features_source_sRNA_by_featureCounts
+cd 3.1.mark_tag_features_source_sRNA_by_featureCounts
+
+BAMS=$(ls ../2.mapping_sRNA_to_genome_by_ShortStack/*/*.bam)
+featureCounts -T ${THREADS} -O -M -R BAM --fraction --fracOverlap 1 \
+    -a "${FEATURES_GFF3}" \
+    -t 'exon' \
+    -g 'biotype' \
+    -o features_source_sRNA-count.txt \
+    ${BAMS} \
+    2>> features_source_sRNA-count.log
+
+cd ../
+
+# ======================== 4. 统计 sRNA 来源与长度分布 ========================
+mkdir -p 4.stat_features_source_sRNA
+cd 4.stat_features_source_sRNA
+
+cp "${PRIORITY_TXT}" ./
+BAMS=$(ls ../3.1.mark_tag_features_source_sRNA_by_featureCounts/*.bam)
+
+for BAM in ${BAMS}
+do
+    sample=$(basename "${BAM}" .bam.featureCounts.bam)
+    python ~/pipelines/featureSrna/split_featurecounts_bam_by_feature_tags.py \
+        -i "${BAM}" -p sRNA_source_feature.priority.txt -o "${sample}.split"
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam.py \
+        -i "${sample}.split" -p sRNA_source_feature.priority.txt \
+        -o "${sample}.features.length_distribution.tsv" -l ${MIN_LEN},${MAX_LEN}
+    python ~/pipelines/featureSrna/plt_sRNA_length_distribution_of_features.py \
+        -i "${sample}.features.length_distribution.tsv" \
+        -p sRNA_source_feature.priority.txt -o "${sample}.features.length_distribution.png"
+done
+
+rename 's/.bam.featureCounts.bam.split/.split/' *.split
+rename 's/.bam.featureCounts.bam.features/.features/' *.png
+
+for BAM in *.CDS.bam
+do
+    sample=$(basename "${BAM}" .CDS.bam)
+    samtools merge -@ 4 "${sample}.gene.bam" \
+        "${sample}.CDS.bam" "${sample}.three_prime_UTR.bam" \
+        "${sample}.five_prime_UTR.bam" "${sample}.coding_gene.bam"
+done
+
+cd ../
+
+# ======================== 5. miRNA 来源 sRNA 统计 ========================
+mkdir -p 5.stat_sRNA_length_dist_per_miRNA
+cd 5.stat_sRNA_length_dist_per_miRNA
+
+awk '$3=="ncRNA_gene"{print $9}' "${MIRNA_GFF3}" | cut -f1 -d';' | sed 's/ID=//g' | sort -u > miRNA.ids.txt
+BAMS=$(ls ../4.stat_features_source_sRNA/*.split.miRNA.bam)
+
+featureCounts -T 8 -O -M -R BAM --fraction --fracOverlap 1 \
+    -a "${MIRNA_GFF3}" -t 'ncRNA_gene' -g 'ID' \
+    -o miRNA_source_sRNA-count.txt ${BAMS} 2>> miRNA_source_sRNA-count.log
+
+rename 's/.bam.featureCounts.bam/.bam/' *.bam
+
+for BAM in *.split.miRNA.bam
+do
+    sample=$(basename "${BAM}" .split.miRNA.bam)
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I miRNA.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.miRNA.length_distribution.uniq.tsv" -t uniq
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I miRNA.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.miRNA.length_distribution.uniq.fraction.tsv" -t uniq -f True
+done
+
+cd ../
+
+# ======================== 6. Intron 来源 sRNA 统计 ========================
+mkdir -p 6.stat_sRNA_length_dist_per_intron
+cd 6.stat_sRNA_length_dist_per_intron
+
+BAMS=$(ls ../4.stat_features_source_sRNA/*.split.intron.bam)
+featureCounts -T 8 -O -M -R BAM --fraction --fracOverlap 1 \
+    -a "${INTRON_GFF3}" -t 'intron' -g 'Name' \
+    -o intron_source_sRNA-count.txt ${BAMS} 2>> intron_source_sRNA-count.log
+
+rename 's/.bam.featureCounts.bam/.bam/' *.bam
+
+for BAM in *.split.intron.bam
+do
+    sample=$(basename "${BAM}" .split.intron.bam)
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I intron.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.intron.length_distribution.uniq.tsv" -t uniq
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I intron.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.intron.length_distribution.uniq.fraction.tsv" -t uniq -f True
+done
+
+cd ../
+
+# ======================== 7. Gene 来源 sRNA 统计 ========================
+mkdir -p 7.stat_sRNA_length_dist_per_gene
+cd 7.stat_sRNA_length_dist_per_gene
+
+BAMS=$(ls ../4.stat_features_source_sRNA/*.split.gene.bam)
+featureCounts -T 8 -O -M -R BAM --fraction --fracOverlap 1 \
+    -a "${GENE_GFF3}" -t 'gene' -g 'ID' \
+    -o gene_source_sRNA-count.txt ${BAMS} 2>> gene_source_sRNA-count.log
+
+rename 's/.bam.featureCounts.bam/.bam/' *.bam
+
+for BAM in *.split.gene.bam
+do
+    sample=$(basename "${BAM}" .split.gene.bam)
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I gene.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.gene.length_distribution.uniq.tsv" -t uniq
+    python ~/pipelines/featureSrna/stat_sRNA_length_distribution_from_splited_bam_per_gene.py \
+        -i "${BAM}" -I gene.ids.txt -l ${MIN_LEN},${MAX_LEN} \
+        -o "${sample}.gene.length_distribution.uniq.fraction.tsv" -t uniq -f True
+done
+
+cd ../
+
+echo "==================== 全部分析完成 ===================="
